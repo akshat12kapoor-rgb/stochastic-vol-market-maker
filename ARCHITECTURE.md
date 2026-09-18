@@ -645,4 +645,285 @@ the full reasoning inline with the code):
 
 ## `backtest` — Backtest Engine Agent
 
-_Not yet started._
+Status: done. Modules: `backtest/market_sim.py` (Heston realized-market
+path generator), `backtest/arrivals.py` (Poisson order-arrival process),
+`backtest/quoter_calibration.py` (derives each run's quoting-pricer
+params from the true market — implements the central framing decision,
+see below), `backtest/engine.py` (`run_backtest`, the event-driven loop),
+`backtest/results.py` (`BacktestResults`, Sharpe/drawdown, plotting),
+re-exported from `backtest/__init__.py`. Report-generation script (not a
+test, mirrors `vol_models/comparison.py`'s convention):
+`backtest/comparison.py` (`python -m backtest.comparison`), output:
+`data/backtest_pnl_comparison.png`.
+
+### THE CENTRAL FRAMING DECISION (flagged — needs sign-off)
+
+If the Heston-quoting run were handed the exact params that generate the
+simulated "true" market, it would have perfect model knowledge no real
+market maker has. **Decision: option (b) from the task brief.** The
+Heston quoter's params are NOT `backtest.market_sim.TRUE_MARKET_PARAMS`.
+Instead (`backtest/quoter_calibration.py`):
+
+1. A synthetic implied-vol surface is built "as if observed" from the
+   true market: price a 7-strike x 4-maturity grid under
+   `TRUE_MARKET_PARAMS` via `vol_models.api.fair_value`, invert each price
+   to a BS implied vol via `vol_models.greeks_utils.implied_vol_from_price`,
+   and add `N(0, 0.005²)` IV noise (emulating bid/ask/staleness noise a
+   desk would actually see — fixed seed for reproducibility).
+2. `vol_models.calibration.calibrate_heston` fits Heston to that noisy
+   surface — the same routine Agent 2 built, used the same way a
+   downstream desk would use it.
+3. The resulting (imperfectly fit) params are used for the **entire**
+   backtest — calibrated once at t=0, never re-calibrated/filtered as the
+   market evolves (no online re-estimation of `v0` or anything else — a
+   real desk periodically recalibrates; that's out of scope here and
+   flagged, not solved).
+
+The Heston quoter therefore keeps the advantage of being the **right
+model family** (mean-reverting stochastic vol, correct skew/smile
+structure) but not the exact numbers — the realistic position a real
+quant desk is in. Any P&L/Sharpe/drawdown edge Heston shows in this setup
+is attributable to "right model family + reasonable calibration", not
+omniscience, and should be read as a **lower bound** on what a
+perfectly-informed Heston quoter could achieve — this materially changes
+how Phase 6 should narrate "why did Heston do better/worse": it's a
+statement about model-family + calibration quality, not about Heston's
+theoretical ceiling.
+
+The **BS quoter's flat vol** is, symmetrically, the true market's own ATM
+(`strike == spot0`) implied vol at a representative maturity (180d),
+computed once at t=0 and held fixed — the most defensible single-number
+choice for a flat-vol desk, so BS's performance reflects its structural
+inability to price skew/smile/term-structure, not a badly-chosen vol
+level.
+
+### Market simulator (`backtest.market_sim`)
+
+```python
+@dataclass(frozen=True)
+class HestonMarketParams:
+    spot0, v0, kappa, theta, sigma, rho, rate: float
+    div_yield: float = 0.0
+    def as_dict(self, v0_override: float | None = None) -> dict: ...
+
+TRUE_MARKET_PARAMS: HestonMarketParams   # the one "ground truth" market
+
+@dataclass(frozen=True)
+class MarketPath:
+    times, spot, variance: np.ndarray   # shape (n_steps+1,)
+    dt: float
+    seed: int
+
+simulate_heston_path(params: HestonMarketParams, n_steps: int, dt: float, seed: int) -> MarketPath
+```
+
+- **Discretization: full truncation Euler** (Lord, Koekkoek & van Dijk,
+  2010) — same family `vol_models.heston.heston_mc_price` uses, though
+  this module is self-contained (no import of `vol_models.heston`): it's
+  market-DATA generation, not pricing. `v_pos = max(v_t, 0)` floors the
+  variance only where it feeds a `sqrt`/drift term; the *state* itself is
+  carried forward unfloored and may go transiently negative (never
+  produces NaN/negative spot — verified in
+  `tests/test_market_sim.py::test_survives_severe_feller_violation_no_nan_or_negative_spot`).
+  Correlated normals: `Z_v = rho*Z_s + sqrt(1-rho**2)*Z_perp`.
+- **`TRUE_MARKET_PARAMS` (flagged decision):** `spot0=100, v0=theta=0.045`
+  (start at the stationary long-run level, ~21.2% annualized vol),
+  `kappa=1.8, sigma=0.55, rho=-0.65, rate=0.03, div_yield=0`. Deliberately
+  **violates the Feller condition** (`2*kappa*theta=0.162 <
+  sigma**2=0.3025`), matching `vol_models`'s own stress-tested
+  Feller-violation case and realistic calibrated-Heston behavior.
+- Deterministic given `(params, n_steps, dt, seed)` — verified in
+  `tests/test_market_sim.py::test_simulate_heston_path_is_deterministic_given_seed`.
+
+### Order arrivals (`backtest.arrivals`)
+
+```python
+fill_intensity(distance: float, base_intensity: float, kappa: float) -> float
+    # = base_intensity * exp(-kappa * distance)
+
+poisson_fill_counts(distance_bid, distance_ask, base_intensity, kappa, dt,
+                     rng: np.random.Generator,
+                     max_expected_arrivals_per_bar: float = 3.0) -> tuple[int, int]
+```
+
+- Implements the fill-intensity model `market_maker.quoting`'s
+  `order_arrival_kappa` assumes but doesn't simulate:
+  `intensity(distance) = A * exp(-kappa * distance)` (classic AS/Gueant).
+  `distance_bid = true_price - bid`, `distance_ask = ask - true_price`
+  (both normally `>= 0`; smaller distance -> more competitive quote ->
+  higher intensity).
+- **`kappa` here MUST equal `generate_quotes`'s `order_arrival_kappa`** —
+  `backtest.engine.run_backtest` enforces this by construction (single
+  `order_arrival_kappa` argument threaded to both), so it cannot silently
+  diverge.
+- **`base_intensity` (flagged decision):** default `80.0` (arrivals/year
+  at zero quote distance) — an order-of-magnitude placeholder for a
+  moderately liquid single-name options market; not calibrated to real
+  order-flow data (none available synthetically). See "risk_aversion
+  retuning" below for why this specific value, paired with the retuned
+  risk aversion, was chosen.
+- **`max_expected_arrivals_per_bar=3.0` cap (flagged decision):** guards
+  `rng.poisson`'s `lam` against blowing up when a quote sits on the
+  "wrong" side of the reference price (`distance < 0` ->
+  `exp(-kappa*distance) > base_intensity`) — this genuinely happens
+  transiently under inventory-skew feedback and, uncapped (an earlier
+  default of 25 was tried), produces a **runaway inventory-accumulation
+  spiral** (observed empirically: >8000 fills over a 63-bar run, P&L
+  diverging to -$140k) rather than the intended mean-reverting behavior.
+
+### `run_backtest` (`backtest.engine`)
+
+```python
+def run_backtest(
+    model: Literal["black_scholes", "heston"],
+    *,
+    true_params: HestonMarketParams = TRUE_MARKET_PARAMS,
+    basket: list[OptionContract] | None = None,          # default: build_default_basket()
+    n_steps: int = 63,                                     # ~1 quarter of daily bars
+    dt: float = 1/252,                                     # daily bars
+    market_seed: int = 42,
+    arrival_seed: int = 123,
+    base_intensity: float = 80.0,
+    order_arrival_kappa: float = 1.5,                      # matches market_maker.quoting's own default
+    risk_aversion: RiskAversion = RiskAversion(delta=0.5, vega=0.02, gamma=0.0),  # retuned, see below
+    flat_vol: float | None = None,                         # auto: true ATM vol @180d if None
+    heston_quoter_params: dict | None = None,              # auto: calibrated from synthetic surface if None
+    sigma_underlying: float | None = None,                 # auto: sqrt(true_params.theta) if None
+    sigma_vol: float | None = None,                        # auto: true_params.sigma if None
+    variance_floor: float = 1e-6,
+) -> BacktestResults
+```
+
+`build_default_basket(strikes=(95,100,105), maturities=(120/365,240/365))`
+— 6 calls, 3 strikes x 2 maturities. Calls-only and this specific
+strike/maturity grid are scope simplifications (puts, and contract
+expiry mid-backtest, are out of scope — maturities are chosen so the
+shortest-dated contract never expires within the default `n_steps=63`
+horizon, min remaining maturity ≈0.079y at the end).
+
+**Loop structure (fixed-bar, not tick-level — flagged decision):** the
+realized market advances by fixed `dt` per bar; order arrivals are a
+Poisson PROCESS *within* each bar (possibly 0, 1, or several fills per
+side per bar). Chosen over a tick-level "market only moves at arrival
+instants" design because (a) it matches the standard daily-Sharpe
+convention, and (b) it keeps "how often the market diffuses" (continuous,
+sampled daily) separate from "how often orders arrive" (genuinely
+event-driven), which are different physical processes.
+
+Per bar `t`: age every contract's remaining maturity
+(`orig_maturity - t*dt`, floored at `1e-6`) -> reprice the TRUE market's
+own fair value at the bar's *realized* (floored) variance state, per
+contract, via `vol_models.fair_value("heston", ...)` — this is the
+arrival process's reference "true" price -> `generate_quotes` with
+whichever pricer is active -> for each contract, draw
+`poisson_fill_counts` on both sides and apply fills (`apply_fill`) ->
+record cash/inventory/marks/greeks.
+
+**Marking convention (flagged decision):** `pnl` is **always** marked
+using the TRUE market's own Heston fair value (never the active quoting
+model's own price) — so a systematically wrong model can't show phantom
+P&L from marking optimism, and the two runs are comparable on a level
+footing. This means `pnl` is not literally "what a desk's own P&L screen
+would show" (a real desk marks to its own model or the observed market
+mid) — flagged as specific to this synthetic, ground-truth-known setting.
+`delta_book`/`vega_book`, by contrast, use the **active quoting model's
+own Greeks** (what the market maker itself believes its exposure is).
+
+**Risk-sizing inputs (flagged decision):** `sigma_underlying` and
+`sigma_vol` (the AS-formula risk-charge inputs `generate_quotes` needs)
+default to `sqrt(true_params.theta)` and `true_params.sigma` — a single
+OBJECTIVE, MODEL-INDEPENDENT estimate used **identically in both runs**,
+so any P&L/Sharpe/drawdown difference is attributable only to which
+fair-value/Greeks engine is quoting, not to one desk having a better risk
+estimate. (Still "cheating" a little, in the same documented way the
+flat-vol/calibration choices are — these are the *true* theta/sigma, not
+estimated from noisy data.)
+
+**`risk_aversion` retuning (flagged decision):** `market_maker.quoting
+.RiskAversion()`'s own bare default `(delta=0.1, vega=0.1)` is tuned for
+a small single-contract book; on this module's multi-contract basket +
+`base_intensity=80`, it's too weak to meaningfully skew quotes against a
+growing book (`delta_book`/`vega_book` reach the tens-to-hundreds here),
+producing a runaway inventory spiral rather than the intended
+mean-reverting behavior (see `backtest.arrivals` note above — this was
+diagnosed together with the arrival-cap issue). `RiskAversion(delta=0.5,
+vega=0.02)` was chosen empirically (grid search over a handful of
+candidates, checking for bounded `max|inventory|` and a non-diverging
+P&L path) specifically for this basket/intensity combination — a free
+parameter choice, not a literature value.
+
+**Order-arrival-kappa consistency:** `order_arrival_kappa` is a single
+argument threaded unchanged to both `generate_quotes` and
+`poisson_fill_counts` — cannot silently diverge by construction, resolving
+the Market Maker agent's decision #5 flag.
+
+`apply_fill(cash, book, contract_id, qty_signed, price) -> new_cash` —
+exposed standalone (not inlined) so the cash/inventory bookkeeping
+identity is directly unit-testable; see
+`tests/test_engine.py::test_apply_fill_conserves_cash_plus_inventory_value`.
+
+### `BacktestResults` (`backtest.results`)
+
+```python
+@dataclass
+class BacktestResults:
+    model: str
+    times, spot_path, variance_path: np.ndarray   # shape (n_steps+1,)
+    dt: float
+    pnl, cash, delta_book, vega_book: np.ndarray   # shape (n_steps+1,)
+    inventory: dict[str, np.ndarray]               # per-contract, shape (n_steps+1,)
+    marks: dict[str, np.ndarray]                   # per-contract TRUE-market marks used in pnl
+    fills: list[dict]                              # {"t","contract_id","side","price","true_price"}
+    sharpe: float
+    max_drawdown: float                            # non-positive
+    meta: dict                                     # full run config, for reproducibility
+
+    total_inventory() -> np.ndarray   # signed sum across contracts
+    gross_inventory() -> np.ndarray   # sum of |inventory| across contracts
+
+compute_sharpe(pnl: np.ndarray, dt: float, ddof: int = 1) -> float
+compute_max_drawdown(pnl: np.ndarray) -> float
+plot_pnl_comparison(results_bs, results_heston, output_path, title=...) -> Path
+```
+
+- **Sharpe convention (flagged decision):** computed on bar-over-bar
+  **dollar** P&L increments (`diff(pnl)`), not percentage returns — a
+  market-making book has no natural "capital base" to divide by.
+  Annualized as `mean(r)/std(r,ddof=1) * sqrt(1/dt)` — the standard daily
+  convention generalized to arbitrary `dt` (`dt=1/252` gives the usual
+  `sqrt(252)`). Returns `0.0` for <3 bars or zero-variance P&L.
+- **Max drawdown:** worst peak-to-trough `pnl - running_max`, returned as
+  a **non-positive** float (0.0 if the equity curve never dips below its
+  prior peak).
+- `plot_pnl_comparison` uses the `Agg` backend (headless-safe, matching
+  `pricing.vol_surface.plot_vol_surface`'s convention), saves a 2-panel
+  PNG (P&L curves; gross inventory curves), creates parent dirs as needed.
+
+### Comparison report (`backtest/comparison.py`)
+
+`python -m backtest.comparison` runs both models with `market_seed=42,
+arrival_seed=123` (identical realized market/arrival-RNG-stream for both —
+verified bit-identical via `spot_path`/`variance_path` equality both in
+`tests/test_engine.py::test_identical_seeds_give_identical_realized_paths_across_models`
+and asserted again at report-generation time), prints a summary, and
+saves `data/backtest_pnl_comparison.png`.
+
+**Results on this run** (single market-path/arrival-seed realization —
+not a Monte-Carlo average across seeds; see final report for why the
+specific winner shouldn't be over-interpreted from one path):
+
+| metric | BS-quoting | Heston-quoting |
+|---|---|---|
+| final P&L | $70.43 | $7.23 |
+| Sharpe (annualized) | 4.37 | 0.33 |
+| max drawdown | -$12.82 | -$45.30 |
+| n_fills | 113 | 116 |
+| max \|inventory\| (any contract) | 22.0 | 17.0 |
+| final \|delta_book\| | 1.41 | 3.51 |
+| final \|vega_book\| | 123.79 | 27.51 |
+
+Heston quoter's calibrated params:
+`{kappa: 1.707, theta: 0.0435, sigma: 0.565, rho: -0.665, v0: 0.0447}`
+(true: `kappa=1.8, theta=0.045, sigma=0.55, rho=-0.65, v0=0.045` — close
+but not exact, as intended). BS quoter's flat vol: `0.1981` (true ATM vol
+at 180d).
