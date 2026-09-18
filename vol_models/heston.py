@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from vol_models.greeks_utils import finite_diff_greeks
+from vol_models.greeks_utils import bs_equivalent_vega, finite_diff_greeks
 
 __all__ = [
     "feller_condition",
@@ -156,17 +156,25 @@ def heston_price(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
 
 def heston_greeks(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
                    option_type="call", div_yield=0.0, n_terms=256, L=12.0) -> dict:
-    """Central-difference Greeks around `heston_price`.
+    """Greeks around `heston_price`.
 
-    delta/gamma: bump spot +/-1%. theta: bump maturity +/-1e-4 (theta =
-    -dPrice/dMaturity). rho: bump rate +/-1e-4. vega: bump sqrt(v0) (the
-    vol-like, annualized-vol-scale parameter) by +/-1e-4 -- i.e. this is
-    "sensitivity to the level of instantaneous vol", not a Black-Scholes
-    vol vega; see ARCHITECTURE.md for why this convention was chosen (to
-    keep the same units as `pricing.black_scholes.bs_greeks`'s vega) and
-    that it needs sign-off. Every other Heston/SABR param (kappa, theta,
-    rho, and for SABR beta/rho/nu) is held fixed -- these Greeks are
-    "sticky-model-parameter" Greeks, not sticky-strike or sticky-delta.
+    delta/gamma: central-difference, bump spot +/-1%. theta: bump maturity
+    +/-1e-4 (theta = -dPrice/dMaturity). rho: bump rate +/-1e-4. Every
+    other Heston param is held fixed for these four -- "sticky-model-
+    parameter" Greeks, not sticky-strike or sticky-delta.
+
+    **vega** is the *Black-Scholes-equivalent* `dPrice/dIV`
+    (`vol_models.greeks_utils.bs_equivalent_vega`: invert `heston_price`'s
+    own output to a BS implied vol via `implied_vol_from_price`, then
+    return `pricing.black_scholes.bs_greeks(...,vol=iv,...)["vega"]`) --
+    this makes it directly comparable to `pricing.black_scholes.bs_greeks`
+    and `vol_models.sabr.sabr_greeks`'s vega, which is what
+    `market_maker`'s quoting engine needs since it applies one
+    `risk_aversion.vega` weight regardless of which pricer is active. The
+    raw finite-difference sensitivity to sqrt(v0) (Heston's own vol-level
+    parameter, bump +/-1e-4) is also returned, under the key `"vega_raw"`,
+    for anyone who specifically wants it -- it is NOT on the same scale as
+    BS vega and should not be used interchangeably with `"vega"`.
     """
     base = heston_price(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
                          option_type, div_yield, n_terms, L)
@@ -188,12 +196,15 @@ def heston_greeks(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
                              option_type, div_yield, n_terms, L)
 
     vol_level = np.sqrt(v0)
-    return finite_diff_greeks(base, price_spot, price_rate, price_maturity, price_vol_level,
-                               spot, rate, maturity, vol_level)
+    greeks = finite_diff_greeks(base, price_spot, price_rate, price_maturity, price_vol_level,
+                                 spot, rate, maturity, vol_level)
+    greeks["vega"] = bs_equivalent_vega(base, spot, strike, maturity, rate,
+                                         option_type=option_type, div_yield=div_yield)
+    return greeks
 
 
 def heston_mc_price(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
-                     option_type="call", div_yield=0.0, n_paths=50_000, n_steps=100,
+                     option_type="call", div_yield=0.0, n_paths=50_000, n_steps=200,
                      antithetic=True, seed=0):
     """Monte Carlo Heston price via full-truncation Euler discretization.
 
@@ -215,6 +226,19 @@ def heston_mc_price(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
     correlated-normal path pairs (Z, -Z) [same sign flip applied to both
     the spot and variance driving noise], discounted payoffs averaged
     per pair before computing mean/stderr across pairs.
+
+    Note on discretization bias: full truncation Euler is a first-order
+    scheme with O(dt) bias (on top of the O(1/sqrt(n_paths)) sampling
+    error `stderr` captures) that grows with vol-of-vol and how badly the
+    Feller condition is violated -- e.g. for a stress config with
+    kappa=1, theta=0.05, sigma=1.2 (2*kappa*theta=0.1 << sigma**2=1.44),
+    empirically the n_steps=100 default-of-old bias was ~0.12 in price
+    units (vs COS), shrinking to ~0.02-0.03 by n_steps=300-600 (see this
+    module's cross-validation test and the final report for the numbers
+    behind the default `n_steps=200`). For realistic/mildly-violated
+    calibrated params the bias is much smaller (sub-stderr at
+    n_steps=300 in the cases we checked). Increase `n_steps` if you need
+    tighter agreement with `heston_price` for extreme parameter regimes.
 
     Returns: (price, stderr) -- stderr is the 1-sigma Monte Carlo standard
     error in price units (paired-average variance for antithetic).

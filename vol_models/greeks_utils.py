@@ -1,11 +1,25 @@
-"""Shared numerical helpers for vol_models: finite-difference Greeks and
-Black-Scholes implied-vol inversion.
+"""Shared numerical helpers for vol_models: finite-difference Greeks,
+BS-equivalent vega, and Black-Scholes implied-vol inversion.
 
 Both Heston (semi-analytic COS price) and SABR (Hagan implied vol -> BS
 price) are priced through deterministic pricing functions, so plain
 central-difference bumping (no common-random-numbers trick needed, unlike
 `pricing.monte_carlo.mc_greeks` which bumps a noisy simulation) is enough
 to get smooth, low-noise Greeks.
+
+**Vega convention (revised):** "vega" for both Heston and SABR is defined
+as the *Black-Scholes-equivalent* `dPrice/dIV`, computed via
+`bs_equivalent_vega` below -- NOT a finite difference on the model's own
+parameters (Heston's sqrt(v0), SABR's alpha). This makes vega genuinely
+comparable across `black_scholes`/`heston`/`sabr`: all three mean "price
+move per unit change in the option's own BS-equivalent implied vol," which
+is what `market_maker`'s quoting engine needs since it applies a single
+`risk_aversion.vega` weight to `vega_book` regardless of which pricer is
+active. See ARCHITECTURE.md's "Vega convention" note for the full
+rationale (this was flagged and fixed after the initial build -- the
+model-parameter-bump version is still available as `finite_diff_greeks`'s
+`"vega_raw"` key for anyone who specifically wants dPrice/d(sqrt(v0)) or
+dPrice/dAlpha).
 """
 from __future__ import annotations
 
@@ -13,13 +27,13 @@ from typing import Callable
 
 from scipy.optimize import brentq
 
-from pricing import bs_price
+from pricing import bs_greeks, bs_price
 
 # Bump sizes, chosen to mirror pricing.monte_carlo.mc_greeks conventions
 # (spot +/-1% relative, rate/maturity 1e-4 absolute). The "vol-level" bump
-# (1e-4) is used for Heston's sqrt(v0) and SABR's alpha -- see each
-# module's fair_value section in ARCHITECTURE.md for what "vega" means
-# for that model.
+# (1e-4) is used for the "vega_raw" diagnostic (Heston's sqrt(v0), SABR's
+# alpha) -- NOT for the primary "vega", which is BS-equivalent (see module
+# docstring).
 SPOT_BUMP_REL = 0.01
 RATE_BUMP = 1e-4
 MATURITY_BUMP = 1e-4
@@ -41,10 +55,14 @@ def finite_diff_greeks(
 
     Each `price_given_*` closure holds every other parameter fixed and
     returns price as a function of the single bumped input. Returns a
-    dict with keys delta, gamma, vega, theta, rho -- same shape/units as
-    `pricing.black_scholes.bs_greeks` (vega per 1.0 vol-level move, theta
-    per 1.0 year with the sign convention theta = -dPrice/dMaturity, rho
-    per 1.0 rate move).
+    dict with keys delta, gamma, vega_raw, theta, rho: delta/gamma/theta/
+    rho match `pricing.black_scholes.bs_greeks`'s units (theta per 1.0
+    year with the sign convention theta = -dPrice/dMaturity, rho per 1.0
+    rate move). `vega_raw` is `dPrice/dVolLevel` for whatever "vol-level"
+    closure the caller passed in (e.g. sqrt(v0) for Heston, alpha for
+    SABR) -- it is NOT the BS-equivalent vega; callers building a
+    `fair_value`-facing greeks dict should overwrite/add a proper "vega"
+    key via `bs_equivalent_vega` instead of relying on this one.
     """
     h_s = spot * SPOT_BUMP_REL
     p_up = price_given_spot(spot + h_s)
@@ -56,7 +74,7 @@ def finite_diff_greeks(
     v_dn_level = max(vol_level - h_v, 1e-6)
     v_up = price_given_vol_level(vol_level + h_v)
     v_dn = price_given_vol_level(v_dn_level)
-    vega = (v_up - v_dn) / ((vol_level + h_v) - v_dn_level)
+    vega_raw = (v_up - v_dn) / ((vol_level + h_v) - v_dn_level)
 
     h_t = MATURITY_BUMP
     t_dn_level = max(maturity - h_t, 1e-8)
@@ -69,7 +87,33 @@ def finite_diff_greeks(
     r_dn = price_given_rate(rate - h_r)
     rho = (r_up - r_dn) / (2 * h_r)
 
-    return {"delta": delta, "gamma": gamma, "vega": vega, "theta": theta, "rho": rho}
+    return {"delta": delta, "gamma": gamma, "vega_raw": vega_raw, "theta": theta, "rho": rho}
+
+
+def bs_equivalent_vega(
+    price: float,
+    spot: float,
+    strike: float,
+    maturity: float,
+    rate: float,
+    option_type: str = "call",
+    div_yield: float = 0.0,
+) -> float:
+    """BS-equivalent vega of an arbitrary model price: dPrice/dIV.
+
+    Since implied vol `iv` is defined by
+    `bs_price(spot,strike,maturity,rate,iv,option_type,div_yield) == price`,
+    the chain rule gives `dPrice/dIV == bs_greeks(...,vol=iv,...)["vega"]`
+    exactly -- no finite-differencing of the upstream model's own
+    parameters is needed. This is what makes "vega" comparable across
+    `black_scholes`/`heston`/`sabr`: all three then mean "price move per
+    unit change in the option's own BS-equivalent implied vol."
+
+    Raises ValueError (propagated from `implied_vol_from_price`) if
+    `price` is not attainable by any vol in the default inversion bracket.
+    """
+    iv = implied_vol_from_price(price, spot, strike, maturity, rate, option_type=option_type, div_yield=div_yield)
+    return bs_greeks(spot, strike, maturity, rate, iv, option_type=option_type, div_yield=div_yield)["vega"]
 
 
 def implied_vol_from_price(

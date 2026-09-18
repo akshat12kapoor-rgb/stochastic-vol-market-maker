@@ -137,7 +137,318 @@ plot_vol_surface(surface: pd.DataFrame, output_path, title=...) -> pathlib.Path
 
 ## `vol_models` — Stochastic Vol Agent
 
-_Not yet started._
+Status: done. Modules: `vol_models/heston.py` (COS pricing + full-truncation-
+Euler Monte Carlo), `vol_models/sabr.py` (Hagan implied-vol formula),
+`vol_models/calibration.py` (least-squares calibration to a vol surface),
+`vol_models/api.py` (`fair_value` dispatcher), `vol_models/greeks_utils.py`
+(shared finite-difference Greeks + BS implied-vol inversion helpers),
+re-exported from `vol_models/__init__.py`. Report-generation script (not a
+test): `vol_models/comparison.py`; write-up: `vol_models/CALIBRATION_NOTES.md`.
+
+Conventions match the `pricing` package throughout: `maturity` in years,
+`rate`/`vol`-like params annualized continuously-compounded, `option_type`
+is `"call"`/`"put"`, greeks dicts always have at least the keys `delta,
+gamma, vega, theta, rho` in the exact units `pricing.black_scholes.bs_greeks`
+uses, **including `vega`**: it is defined as the Black-Scholes-equivalent
+`dPrice/dIV` for every model (`heston`, `sabr`, and `pricing`'s own
+`black_scholes`/`monte_carlo`), so it is directly comparable/safe to use
+with a single scalar risk weight regardless of which pricer is active —
+see "Vega convention" below for how this is computed and why it replaced
+an earlier, non-comparable convention. Both `heston_greeks` and
+`sabr_greeks` also return one extra, non-required key, `"vega_raw"` — a
+diagnostic, model-parameter-bump sensitivity that is NOT on the same scale
+as `"vega"` and should not be used by any comparability-sensitive caller
+(e.g. `market_maker`'s book-level `vega_book`/`risk_aversion.vega`).
+
+### Model-agnostic entrypoint (preferred for other agents — matches `pricing.api.price`'s shape)
+
+```python
+from vol_models import fair_value
+fair_value(model: Literal["heston", "sabr"], params: dict,
+           spot: float, strike: float, maturity: float,
+           option_type: Literal["call", "put"] = "call") -> tuple[float, dict[str, float]]
+```
+- `"heston"` params — required: `"kappa"` (mean-reversion speed, float >0),
+  `"theta"` (long-run variance, float >0), `"sigma"` (vol-of-vol, float >0),
+  `"rho"` (spot/vol correlation, float in (-1,1)), `"v0"` (initial
+  variance, float >0), `"rate"` (float). Optional: `"div_yield"` (default
+  `0.0`), `"n_terms"` (COS series length, default `256`), `"L"` (COS
+  truncation width in std devs, default `12.0`).
+- `"sabr"` params — required: `"alpha"` (vol-of-forward level, float >0),
+  `"rho"` (float in (-1,1)), `"nu"` (vol-of-vol, float >0), `"rate"`
+  (float). Optional: `"beta"` (CEV exponent, default `1.0` — see "SABR
+  beta convention" below), `"div_yield"` (default `0.0`).
+- Returns `(price, greeks)`, same shape as `pricing.api.price`.
+- Raises `ValueError` for an unrecognized `model` string, and for
+  `maturity <= 0` (unlike `pricing.api.price`, there is **no** `maturity
+  == 0` special case here — both the COS method and Hagan's formula
+  require `T > 0`). Raises `KeyError` (not `ValueError`) if a required
+  `params` key is missing, naming the missing keys.
+- Never mutates `params`. Fully deterministic (no RNG in the dispatch
+  path — `heston_mc_price` is a separate, non-dispatched function, see
+  below).
+
+### `vol_models.heston`
+
+```python
+feller_condition(kappa, theta, sigma) -> bool   # True iff 2*kappa*theta >= sigma**2
+
+heston_price(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
+             option_type="call", div_yield=0.0, n_terms=256, L=12.0) -> float
+
+heston_greeks(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
+              option_type="call", div_yield=0.0, n_terms=256, L=12.0) -> dict[str, float]
+
+heston_mc_price(spot, strike, maturity, rate, kappa, theta, sigma, rho, v0,
+                 option_type="call", div_yield=0.0, n_paths=50_000, n_steps=200,
+                 antithetic=True, seed=0) -> tuple[float, float]
+```
+- **Pricing method (flagged — needs sign-off):** semi-analytic pricing via
+  the **COS method** (Fang & Oosterlee, 2008), not Carr-Madan. Chosen
+  because it needs only real-`u` characteristic-function evaluations (no
+  numerical integration/quadrature over a damping parameter), converges
+  spectrally in `n_terms` for smooth densities, and is a single formula
+  that handles call/put via different payoff-coefficient sub-intervals.
+  Characteristic function uses the **"little trap" parameterization**
+  (Albrecher, Mayer, Schoutens & Tistaert, 2007) rather than the original
+  1993 Heston formula, to avoid a branch-cut discontinuity in the complex
+  logarithm for long maturities / large vol-of-vol.
+- **Truncation range (flagged — needs sign-off):** `[a,b]` is centered on
+  the first two cumulants of `ln(S_T/S_0)`, computed **numerically** as
+  finite differences of the cumulant-generating function built from the
+  same characteristic function used for pricing (not the closed-form
+  Heston cumulant expressions, to avoid transcription risk) — step size
+  `h=1e-2`, chosen empirically to balance truncation error against
+  floating-point cancellation (see module source comment; `h=1e-4` loses
+  all precision on the second cumulant for near-deterministic params).
+  Default width is `L=12` standard deviations, `n_terms=256` cosine terms;
+  `calibration.py` uses cheaper `n_terms=128/96, L=12` during the
+  optimization loop for speed. Verified to reproduce `pricing.bs_price` to
+  <1e-4 in the `sigma->0, v0=theta=vol**2` deterministic limit, and to
+  agree with `heston_mc_price` within the tolerance in
+  `tests/test_heston.py` across ATM/ITM/OTM and Feller-satisfied/violated
+  configs.
+- **Feller condition handling:** `feller_condition` is purely informational
+  (returns whether `2*kappa*theta >= sigma**2`, i.e. whether the
+  continuous-time CIR variance process is guaranteed to stay positive).
+  Calibrated params routinely violate it — `heston_mc_price` handles this
+  via **full-truncation Euler discretization** (Lord, Koekkoek & van Dijk,
+  2010): at every step, `v_pos = max(v, 0)` is used everywhere `v` would
+  feed a square root or the current-level term of the drift, while the
+  *state* `v` itself is carried forward unfloored and may go transiently
+  negative — this guarantees no `sqrt` of a negative number and no NaN/
+  complex values regardless of the Feller condition. See
+  `tests/test_heston.py::test_heston_mc_survives_severe_feller_violation`.
+  Full-truncation Euler carries a first-order-in-`dt` discretization bias
+  in addition to Monte Carlo sampling noise (bias grows with vol-of-vol
+  and severity of Feller violation) — empirically ~0.12 in price units at
+  `n_steps=100` for a stress config (`kappa=1, theta=0.05, sigma=1.2`),
+  shrinking to ~0.02-0.03 by `n_steps=300-600`; default `n_steps=200`
+  trades this off against runtime (see `heston_mc_price` docstring for the
+  full numbers).
+- **Variance reduction:** antithetic variates (default `antithetic=True`),
+  same convention/stderr computation as `pricing.monte_carlo.mc_price`
+  (paired-average variance across `(Z,-Z)` path pairs, with the sign flip
+  applied to both the spot and variance driving noise).
+- `heston_mc_price` raises `ValueError` if `maturity <= 0`. Returns
+  `(price, stderr)`; `stderr` is the 1-sigma Monte Carlo standard error in
+  price units.
+- **Vega convention (revised — resolved, no longer needs sign-off):**
+  `heston_greeks`'s `"vega"` is the **Black-Scholes-equivalent**
+  `dPrice/dIV`: invert `heston_price`'s own output to an implied vol via
+  `vol_models.greeks_utils.implied_vol_from_price`, then evaluate
+  `pricing.black_scholes.bs_greeks(...,vol=iv,...)["vega"]`
+  (`vol_models.greeks_utils.bs_equivalent_vega`). Since `iv` is defined by
+  `bs_price(...,iv,...) == heston_price(...)`, the chain rule makes this
+  exact — no finite-differencing of Heston's own parameters. This
+  replaces an earlier `dPrice/d(sqrt(v0))` convention that was flagged and
+  found **not** comparable to SABR's or Black-Scholes' vega on realistic
+  params (differed by ~2x for otherwise-matched ATM configs) — `vega` now
+  means the same thing ("price move per unit change in the option's own
+  BS-equivalent implied vol") across `black_scholes`/`monte_carlo`/
+  `heston`/`sabr`, which is required for `market_maker`'s single
+  `risk_aversion.vega` weight applied to `vega_book` to mean the same
+  thing regardless of which pricer generated the book's Greeks. The old
+  `dPrice/d(sqrt(v0))` sensitivity is still available under the key
+  `"vega_raw"` (central difference, bump `1e-4`) for anyone who
+  specifically wants it — it is not on the same scale as `"vega"` and
+  should not be substituted for it. `delta`/`gamma` bump spot ±1%,
+  `theta` bumps maturity ±1e-4 (`theta = -dPrice/dMaturity`), `rho` bumps
+  rate ±1e-4 — unchanged, all holding every other Heston param fixed
+  ("sticky-model-parameter" Greeks, not sticky-strike/sticky-delta).
+  Verified in `tests/test_heston.py::test_heston_vega_is_bs_equivalent_by_construction`
+  and, cross-model, in
+  `tests/test_sabr.py::test_vega_is_comparable_across_black_scholes_heston_sabr_near_atm`
+  (BS/Heston/SABR vega now agree to <5% for matched near-ATM implied
+  vols, vs. the old convention's ~2x gap in the analogous case).
+
+### `vol_models.sabr`
+
+```python
+sabr_implied_vol(forward, strike, maturity, alpha, beta, rho, nu) -> float | np.ndarray
+sabr_price(spot, strike, maturity, rate, alpha, beta, rho, nu,
+           option_type="call", div_yield=0.0) -> float
+sabr_greeks(spot, strike, maturity, rate, alpha, beta, rho, nu,
+            option_type="call", div_yield=0.0) -> dict[str, float]
+```
+- Hagan, Kumar, Lesniewski & Woodward (2002) lognormal SABR asymptotic
+  implied-vol formula (general `beta`, not a special-cased `beta=1` or
+  `beta=0` formula) — reduces smoothly to the closed-form ATM vol as
+  `strike -> forward` (the `z/x(z) -> 1` limit is applied wherever
+  `|z| < 1e-8`; no separate ATM branch/division-by-zero). `sabr_price`
+  converts that vol to a price via `pricing.black_scholes.bs_price`
+  (imported, not reimplemented) using `forward = spot *
+  exp((rate-div_yield)*maturity)`; raises `ValueError` if `maturity <= 0`.
+  `sabr_implied_vol`'s `forward`/`strike`/`maturity` args are scalar-or-
+  broadcastable-array (vectorized, no loop needed for a whole strike/
+  maturity grid).
+- **SABR beta convention (flagged — needs sign-off):** `beta` defaults to
+  `1.0` (lognormal SABR — forward dynamics `dF = alpha*F*dW`) everywhere
+  in this module and in `calibrate_sabr`, and is **not calibrated by
+  default** (only `alpha, rho, nu` are fit; `beta` is a fixed input).
+  Reasoning: beta and rho are close to unidentifiable from a single vol
+  smile (both drive skew), so the standard practitioner approach is to
+  fix beta from an external view and calibrate the rest; beta=1 is the
+  natural match for an equity-index-style, BS-vol-quoted surface (what
+  `pricing.vol_surface` produces). `beta` is a free function argument
+  throughout (not hardcoded), so callers needing e.g. `beta=0.5` (a
+  common rates convention) can pass it directly — `calibrate_sabr` does
+  not currently support calibrating `beta` itself.
+- **Vega convention (revised — resolved, no longer needs sign-off):**
+  `sabr_greeks`'s `"vega"` is the same **Black-Scholes-equivalent**
+  `dPrice/dIV` as `heston_greeks` (via `bs_equivalent_vega`) — see the
+  Heston section above for the full rationale and the cross-model
+  verification test. The old `dPrice/dAlpha` sensitivity (alpha is SABR's
+  vol-of-forward level, the closest per-model analog to a BS vol, but not
+  identical to it in general) is still available under `"vega_raw"`
+  (central difference, bump `1e-4`) — note that for beta=1 near the money
+  `vega_raw` and `vega` can sit close together numerically (alpha
+  approximates the ATM vol when beta=1), which is expected, not a
+  contradiction; they diverge further from the money and for beta<1.
+  `delta`/`gamma`/`theta`/`rho` bump conventions are unchanged and
+  identical to `heston_greeks` (spot ±1%, maturity ±1e-4 with
+  `theta=-dPrice/dMaturity`, rate ±1e-4), holding alpha/beta/rho/nu fixed
+  ("sticky-strike-in-alpha", recomputing the forward and Hagan vol at each
+  bumped spot).
+
+### `vol_models.calibration`
+
+```python
+calibrate_heston(surface, spot, rate=0.0, div_yield=0.0, initial_guess=None,
+                  weights="equal", n_terms=128, L=12.0, max_nfev=150, verbose=0) -> dict
+calibrate_sabr(surface, spot, rate=0.0, div_yield=0.0, beta=1.0, initial_guess=None,
+               weights="equal", max_nfev=200, verbose=0) -> dict
+calibrate(model: Literal["heston", "sabr"], surface, spot, **kwargs) -> dict
+surface_rmse(model_iv: array-like, target_iv: array-like) -> float
+```
+- `surface`: a `pricing.vol_surface.generate_vol_surface`-shaped DataFrame
+  (maturity-indexed rows, strike columns) — reshaped internally via
+  `pricing.vol_surface.vol_surface_to_long`. Both functions calibrate a
+  single **global** parameter set across every (strike, maturity) point in
+  `surface` — see the "global vs per-maturity SABR" caveat below.
+- Returns a dict directly usable as `vol_models.fair_value`'s `params`
+  argument for that model (includes `"rate"`/`"div_yield"` echoing the
+  inputs, plus `"beta"` for SABR).
+- **Optimizer (flagged — needs sign-off):** `scipy.optimize.least_squares`
+  with `method="trf"` (bounded trust-region-reflective), minimizing
+  per-grid-point residuals `weight_i * (model_iv_i - target_iv_i)` in
+  implied-vol space (not price space) — for Heston this requires inverting
+  each COS price back to a BS implied vol via
+  `vol_models.greeks_utils.implied_vol_from_price` (Brent's method against
+  `pricing.bs_price`; grid points where no vol in `[1e-4, 5.0]` attains the
+  model price are assigned a fixed penalty residual of `1.0`, not dropped
+  or NaN'd, so the optimizer is pushed away from that region rather than
+  crashing). SABR needs no inversion (`sabr_implied_vol` gives IV
+  directly), so `calibrate_sabr` has no price-inversion step and is
+  correspondingly much faster. `trf` (not unconstrained `lm`) was chosen
+  specifically so hard parameter-feasibility bounds (kappa/theta/sigma/v0/
+  alpha/nu > 0, `|rho| < 1`) can be passed as `bounds` directly.
+- **Weighting scheme (flagged — needs sign-off):** `weights="equal"`
+  (default) weights every grid point equally in the least-squares
+  objective. `weights="vega"` is also implemented — weights by
+  `pricing.black_scholes.bs_greeks(..., vol=target_iv)["vega"]` normalized
+  to mean 1, which down-weights deep-OTM wings where a given price error
+  maps to a large IV error. Equal-weight is the default because the
+  target surface is a smooth synthetic construction with no bid/ask
+  liquidity signal to weight by; this is a judgment call PROJECT.md rule 3
+  asks to flag rather than pick silently.
+- **Initial guess / bounds:** if `initial_guess` is omitted, Heston seeds
+  `kappa=1.5, sigma=0.6, rho=-0.5`, `theta=v0=mean(target_iv)**2`; SABR
+  seeds `alpha=mean(target_iv), rho=-0.3, nu=0.4`. Bounds: Heston
+  `kappa∈[0.05,15], theta∈[1e-4,4], sigma∈[0.02,3], rho∈[-0.999,0.999],
+  v0∈[1e-4,4]`; SABR `alpha∈[1e-4,5], rho∈[-0.999,0.999], nu∈[1e-4,5]`
+  (beta fixed, not bounded/calibrated).
+- **Global vs per-maturity SABR (flagged as a modeling limitation, not
+  just a decision):** `calibrate_sabr` fits **one** `(alpha, rho, nu)`
+  triple across the whole surface, not a separate triple per maturity
+  (which is how SABR is normally used in practice — it has no built-in
+  term structure). This was chosen to match `fair_value`'s single-flat-
+  `params`-dict contract (one dict per model, no maturity-indexed lookup)
+  so the Market Maker agent can swap models without restructuring its
+  `params` handling. Consequence: SABR's fit quality degrades markedly
+  away from whichever maturity the global fit "centers" on — see
+  `CALIBRATION_NOTES.md` for the actual RMSE-by-maturity breakdown. Heston
+  does not have this limitation (kappa/theta mean-reversion gives it
+  genuine, if constrained, term structure).
+- `surface_rmse(model_iv, target_iv)`: plain `sqrt(mean((model_iv -
+  target_iv)**2))` in implied-vol units (e.g. `0.01` == 1 vol point). Pure
+  function, no fitting.
+
+### `vol_models.greeks_utils`
+
+```python
+finite_diff_greeks(base_price, price_given_spot, price_given_rate,
+                    price_given_maturity, price_given_vol_level,
+                    spot, rate, maturity, vol_level) -> dict[str, float]
+bs_equivalent_vega(price, spot, strike, maturity, rate,
+                    option_type="call", div_yield=0.0) -> float
+implied_vol_from_price(price, spot, strike, maturity, rate,
+                        option_type="call", div_yield=0.0, lo=1e-4, hi=5.0) -> float
+```
+- `finite_diff_greeks`: shared central-difference Greeks helper used by
+  both `heston_greeks` and `sabr_greeks` — takes four one-argument pricing
+  closures (each holding every other parameter fixed) and returns
+  `delta,gamma,vega_raw,theta,rho` (**not** `"vega"` — see
+  `bs_equivalent_vega` immediately below; this function's own "vega-like"
+  output is deliberately named `vega_raw` since it's a raw bump on
+  whatever `vol_level` closure the caller passed in, not necessarily
+  comparable across models). No common-random-numbers trick needed
+  (unlike `pricing.monte_carlo.mc_greeks`) since both `heston_price` (COS)
+  and `sabr_price` (Hagan formula) are deterministic.
+- `bs_equivalent_vega`: the function both `heston_greeks` and
+  `sabr_greeks` call to fill in their actual `"vega"` key — inverts
+  `price` to an implied vol via `implied_vol_from_price`, then returns
+  `pricing.black_scholes.bs_greeks(...,vol=iv,...)["vega"]`. Exact by the
+  chain rule (`dPrice/dIV` where `iv` is defined by `bs_price(...,iv,...)
+  == price`), so this is what makes `"vega"` comparable across
+  `black_scholes`/`heston`/`sabr` — see the "Vega convention" notes above.
+- `implied_vol_from_price`: Brent's method (`scipy.optimize.brentq`)
+  inverting `pricing.black_scholes.bs_price` for the vol that reproduces a
+  given `price`. Raises `ValueError` if `price` is not attainable by any
+  vol in `[lo, hi]` — calibration callers catch this and assign a penalty
+  residual (see `calibration.py` above) rather than letting it propagate.
+
+### Comparison report (`vol_models/comparison.py`, `vol_models/CALIBRATION_NOTES.md`)
+
+`python -m vol_models.comparison` (or `run_comparison(...)`) calibrates
+Heston and SABR against `pricing.vol_surface.generate_vol_surface`'s
+**default-parameter** surface (`spot=100`, `strikes=70..130 step 5` (13
+strikes), `maturities=[1M,3M,6M,1Y,2Y,3Y]`, `rate=0.03` and `div_yield=0.0`
+assumed — flagged in the module docstring, since the target IV surface
+itself carries no rate), computes a single "calibrated" constant BS vol
+(closed-form: the mean of all target IVs, the equal-weight-least-squares-
+optimal constant), and saves a 2x3 grid of per-maturity smile plots (target
+vs BS vs Heston vs SABR) to `data/vol_model_comparison.png`. Not part of
+`pytest` — it is a report script, not a correctness test.
+
+**Results on this grid** (full write-up with the strike/maturity error
+breakdown in `vol_models/CALIBRATION_NOTES.md`): IV RMSE — BS (flat) =
+0.0698, Heston (calibrated) = 0.0147, SABR (calibrated, global) = 0.0339.
+BS mis-prices worst at short-dated, far-OTM-put strikes (single worst
+point: K=70, T=1M, error 0.235 in IV) where the synthetic surface's
+negative skew and positive smile convexity are both steepest, and is
+closest to correct near-the-money at longer maturities where the surface's
+skew/smile has decayed toward its flatter long-maturity asymptote.
 
 ## `market_maker` — Market Maker Core Agent
 
