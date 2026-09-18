@@ -927,3 +927,114 @@ Heston quoter's calibrated params:
 (true: `kappa=1.8, theta=0.045, sigma=0.55, rho=-0.65, v0=0.045` — close
 but not exact, as intended). BS quoter's flat vol: `0.1981` (true ATM vol
 at 180d).
+
+## `webapp` — Web UI
+
+Status: done. FastAPI backend (`webapp/main.py`, `webapp/routers/*.py`) +
+a static single-page frontend (`webapp/static/`, vanilla JS + Plotly, no
+build step). Imports `pricing`, `vol_models`, `market_maker`, `backtest`
+as a library only — **none of those four packages were modified.** No
+database; an in-memory `webapp/store.py` caches recent backtest runs
+(needed because `BacktestResults` doesn't carry the basket that produced
+it) and the sweep's deterministic quoter params.
+
+Run with (project root, venv active):
+```bash
+uvicorn webapp.main:app --reload --port 8000
+```
+Then open `http://localhost:8000/`.
+
+### The pricer contract, preserved
+
+Every pricer-swapping endpoint routes through the exact shared signature
+`(model, params, spot, strike, maturity, option_type) -> (price, greeks)`
+(`pricing.api.price` for `black_scholes`/`monte_carlo`,
+`vol_models.api.fair_value` for `heston`/`sabr`) — the webapp never
+reimplements pricing logic, only dispatches to it. `greeks["vega"]` is
+labeled and treated everywhere as the BS-equivalent `dPrice/dIV` (see the
+`vol_models` section above); `vega_raw` is surfaced only as an explicitly
+labeled diagnostic (e.g. in `POST /api/pricer/price`'s response), never as
+the primary vega.
+
+### Quote waterfall — the safety-critical piece
+
+`webapp/derive.py`'s `build_quote_waterfall` decomposes a `Quote` into its
+additive terms (`delta_skew`, `vega_skew`, `risk_spread_delta`,
+`risk_spread_vega`, `liquidity_spread`, `gamma_term`) by re-deriving each
+term from the exact formulas in `market_maker/quoting.py`, but computes
+`reservation_price`/`spread`/`bid`/`ask` by **calling**
+`market_maker.quoting.reservation_price` / `quote_spread` directly — so
+its output can never silently drift from the real engine's. This is
+asserted in `tests/test_webapp_derive.py` (unit-level, parametrized) and
+`tests/test_webapp_backtest.py::test_backtest_waterfall_reconstructs_engine_quote_exactly`
+(API-level, against a real run). If `market_maker/quoting.py`'s formulas
+ever change, these tests fail rather than letting the UI "explain" a
+mechanism it no longer matches.
+
+`POST /api/backtest/waterfall` reconstructs a bar's quote by rebuilding a
+`market_maker.book.Book` from the cached run's basket +
+`results.inventory[contract_id][bar_index]` (both already available — no
+backtest re-run, no engine changes) and calling
+`market_maker.quoting.generate_quotes` fresh, exactly as the build spec
+requires. `risk_aversion_delta_override` / `risk_aversion_vega_override`
+recompute the decomposition live for the "what-if" sliders without
+touching the completed run (`is_what_if: true` in the response flags this).
+
+### Endpoints
+
+- `GET /api/pricer/defaults?model=...`, `POST /api/pricer/price` (point
+  price + Greeks; Monte Carlo also returns `stderr` from
+  `pricing.monte_carlo.mc_price` directly, since `pricing.api.price` drops
+  it for cross-model shape parity), `POST /api/pricer/profile` (Greeks
+  across a strike grid — Monte Carlo intentionally excluded, explicit-run
+  only per the performance constraints).
+- `GET /api/vol-surface/defaults`, `POST /api/vol-surface/generate`,
+  `POST /api/vol-surface/calibrate` (Heston + SABR fit, per-model
+  `residual_grid` = model IV − target IV, `rmse` via
+  `vol_models.calibration.surface_rmse`; response always carries
+  `not_arbitrage_checked: true` and an explanatory `note`).
+- `POST /api/backtest/run`, `POST /api/backtest/run-pair` (same seed pair,
+  both models, one call — the BS-vs-Heston comparison the project is built
+  around), `GET /api/backtest/run/{run_id}`, `POST /api/backtest/waterfall`
+  (see above). Both model's default `flat_vol`/`heston_quoter_params`, if
+  not explicitly passed, come from `webapp.store.get_sweep_quoter_params()`
+  — a cached, deterministic function of `TRUE_MARKET_PARAMS` alone (a
+  performance judgment call: identical numbers to what `run_backtest` would
+  compute unprompted, just not recomputed — mainly saves the ~1s Heston
+  calibration — on every request).
+- `GET /api/sweep/results` (reads `data/sweep_results.csv`, never
+  recomputes — the 40-seed sweep is ~105s and must never block a page
+  load), `GET /api/sweep/regression?feature=...` (OLS fit + CI + bootstrap
+  CI on the paired difference, via `webapp/derive.py`'s `ols_with_ci` /
+  `bootstrap_mean_ci` — states plainly when a feature shows no detectable
+  relationship rather than implying one), `POST /api/sweep/reproduce`
+  (re-runs one seed for both models with the exact sweep parameterization —
+  verified byte-for-byte against `notebooks/FINAL_REPORT.md`'s seed 15 and
+  seed 25 case studies), `POST /api/sweep/recompute` +
+  `GET /api/sweep/recompute/status/{job_id}` (background thread, pollable
+  progress; **do not call `/recompute` in a test** — it overwrites the
+  committed `data/sweep_results.csv`).
+
+### Decisions flagged for sign-off
+
+1. **Pair-mode inventory panel shows gross inventory, not per-contract.**
+   Showing all 6 contracts x 2 models (12 lines) in View 3's inventory
+   panel in pair mode was judged too busy to be readable; per-contract
+   detail is only shown in single-run mode. A simplification, not a
+   limitation of the data (per-contract inventory for both runs is present
+   in the API response either way).
+2. **Waterfall rendered as three linked Plotly `waterfall` traces**
+   (fair_value → reservation_price, then reservation_price → ask and
+   reservation_price → bid as two separate branches), not one connected
+   figure — Plotly's native waterfall trace type doesn't support a single
+   run forking into two directions from a midpoint. Values are still
+   exactly reconstructed (see above); this is a rendering choice only.
+3. **Filtering fills by contract/negative-edge also recomputes the
+   cumulative-edge line and summary tiles for the filtered subset**, not
+   just the markers — judged more useful (a user filtering to one contract
+   wants that contract's edge story), though the spec's wording was
+   ambiguous on this point.
+4. **`GET /api/sweep/regression`'s significance threshold is p < 0.05**,
+   stated as a conventional (not sacred) cutoff at whatever `n` the sweep
+   currently has — flagged since p-values from n=40 OLS shouldn't be
+   over-trusted; the verdict text says so explicitly.

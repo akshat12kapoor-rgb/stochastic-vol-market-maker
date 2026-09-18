@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Options Market Maker — Stochastic Vol</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>Options Market Maker <span class="subtitle">— stochastic volatility engine</span></h1>
+  <nav id="tabs">
+    <button class="tab-btn active" data-view="pricer">Pricer</button>
+    <button class="tab-btn" data-view="volsurface">Vol Surface</button>
+    <button class="tab-btn" data-view="run">Run</button>
+    <button class="tab-btn" data-view="sweep">Sweep / Conditional Edge</button>
+  </nav>
+</header>
+
+<main>
+  <section id="view-pricer" class="view active"></section>
+  <section id="view-volsurface" class="view"></section>
+  <section id="view-run" class="view"></section>
+  <section id="view-sweep" class="view"></section>
+</main>
+
+<div id="toast"></div>
+
+<script src="common.js"></script>
+<script src="view_pricer.js"></script>
+<script src="view_volsurface.js"></script>
+<script src="view_run.js"></script>
+<script src="view_sweep.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
