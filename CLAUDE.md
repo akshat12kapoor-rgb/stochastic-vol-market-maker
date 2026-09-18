@@ -2,7 +2,8 @@
 
 Options market maker with stochastic volatility modeling (Black-Scholes, Heston,
 SABR pricing; a multi-Greek Avellaneda-Stoikov quoting engine; an event-driven
-backtester comparing BS-quoting vs Heston-quoting market makers).
+backtester comparing BS-quoting vs Heston-quoting market makers) plus a FastAPI +
+Plotly web UI (`webapp/`) over the same engine.
 
 ## Orientation
 
@@ -19,7 +20,7 @@ backtester comparing BS-quoting vs Heston-quoting market makers).
 
 ```bash
 source .venv/bin/activate   # already created; do not recreate or reinstall
-pytest -q                   # 143 tests, should be green
+pytest -q                   # 167 tests, should be green
 ```
 
 Dependencies are pinned in `requirements.txt` (no poetry — wasn't installed
@@ -32,6 +33,7 @@ python -m pricing.vol_surface        # (import only; see pricing/vol_surface.py 
 python -m vol_models.comparison      # BS vs Heston vs SABR vol-surface fit comparison -> data/vol_model_comparison.png
 python -m backtest.comparison        # single-path BS-quoting vs Heston-quoting backtest -> data/backtest_pnl_comparison.png
 python -m notebooks.sweep_analysis   # 40-seed sweep + regime case studies -> data/sweep_*.png, notebooks/FINAL_REPORT.md
+uvicorn webapp.main:app --reload --port 8000   # web UI -> http://localhost:8000/
 ```
 
 ## Key facts worth knowing before changing anything
@@ -57,8 +59,21 @@ python -m notebooks.sweep_analysis   # 40-seed sweep + regime case studies -> da
   P&L/Sharpe over 40 seeds) driven by a genuine, structural delta difference
   from Heston's calibrated skew — not a bug. See `notebooks/FINAL_REPORT.md`
   §4 before "fixing" an apparent asymmetry between the two quoting runs.
+- `webapp/` imports `pricing`/`vol_models`/`market_maker`/`backtest` as a
+  library only — it has never modified any of the four, and shouldn't.
+  Its quote-waterfall panel re-derives `market_maker.quoting`'s reservation
+  price / spread math and is tested to reconstruct the engine's own output
+  exactly (`tests/test_webapp_derive.py`,
+  `tests/test_webapp_backtest.py::test_backtest_waterfall_reconstructs_engine_quote_exactly`)
+  — if you touch `market_maker/quoting.py`'s formulas, that test is the
+  canary; don't hand-patch `webapp/derive.py` to make it pass again without
+  checking the two are still saying the same thing for the same reason.
+- **Never call `POST /api/sweep/recompute` from a test** — it overwrites
+  the committed `data/sweep_results.csv`. `tests/test_webapp_sweep.py`
+  deliberately doesn't exercise it.
 
 ## Git
 
-Plain git, no remote configured. One commit per reviewed phase/agent; see
+GitHub remote `origin` → https://github.com/akshat12kapoor-rgb/stochastic-vol-market-maker
+(private). One commit per reviewed phase/agent/webapp-view; see
 `git log --oneline` for the build history.
