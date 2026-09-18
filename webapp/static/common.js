@@ -1,5 +1,10 @@
 // Shared helpers used by every view.
 
+// Declared here (loaded first) rather than in app.js (loaded last) --
+// each view_*.js file assigns window.Views.<name> at its own load time and
+// must find this already present.
+window.Views = window.Views || {};
+
 const API = {
   async post(path, body) {
     const resp = await fetch(path, {

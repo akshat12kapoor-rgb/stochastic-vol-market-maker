@@ -131,14 +131,18 @@
         el("div", { class: "col" }, [el("div", { id: "plot-wf-bid", class: "plot short" })]),
       ]),
     ]));
-
-    linkXAxes(["plot-spot", "plot-variance", "plot-pnl", "plot-greeks-book", "plot-inventory"]);
+    // NOTE: linkXAxes is NOT called here. Plotly only attaches `.on()` to a
+    // div after Plotly.newPlot() has drawn something in it, and at initial
+    // render() no backtest has run yet (the plot divs are still empty) --
+    // calling it here throws "div.on is not a function" every time. It's
+    // called instead from renderPanels()/renderFillsAndPnlOverlay() (via
+    // afterRunsUpdated()), after the real plots exist.
   }
 
   function linkXAxes(ids) {
     ids.forEach((id) => {
       const div = document.getElementById(id);
-      if (!div || div._linkedSynced) return;
+      if (!div || div._linkedSynced || typeof div.on !== "function") return;
       div._linkedSynced = true;
       div.on("plotly_relayout", (ev) => {
         const range = ev["xaxis.range[0]"] !== undefined ? [ev["xaxis.range[0]"], ev["xaxis.range[1]"]] : null;

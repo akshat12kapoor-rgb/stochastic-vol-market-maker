@@ -60,7 +60,8 @@
         el("div", { class: "col", style: "min-width:150px;flex:0 0 220px" }, [shapeSlider(key, def, min, max, step)])
       )),
       el("div", { class: "controls", style: "margin-top:10px" }, [
-        el("button", { class: "action", onclick: runCalibration }, ["Fit Heston + SABR"]),
+        el("button", { class: "action", id: "fit-btn", onclick: runCalibration }, ["Fit Heston + SABR"]),
+        el("span", { class: "note", style: "margin:0" }, ["Calibration is CPU-bound (scipy optimizer over the full grid) — typically 10-25s, not live."]),
       ]),
     ]);
     r.appendChild(controlsPanel);
@@ -149,7 +150,9 @@
   }
 
   async function runCalibration() {
-    toast("Fitting Heston + SABR…");
+    const btn = document.getElementById("fit-btn");
+    if (btn) { btn.disabled = true; btn.textContent = "Fitting… (10-25s)"; }
+    toast("Fitting Heston + SABR — this is a CPU-bound optimizer run, typically 10-25s for the full grid…");
     try {
       const body = await API.post("/api/vol-surface/calibrate", {
         spot: state.spot, strikes: state.strikes, maturities: state.maturities, ...state.shape,
@@ -164,7 +167,11 @@
       plotResidualHeatmap("plot-residual-heston", body.strikes, body.maturities, body.fits.heston.residual_grid);
       plotResidualHeatmap("plot-residual-sabr", body.strikes, body.maturities, body.fits.sabr.residual_grid);
       toast("Calibration complete.");
-    } catch (e) { toast("Calibration failed: " + e.message, true); }
+    } catch (e) {
+      toast("Calibration failed: " + e.message, true);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = "Fit Heston + SABR"; }
+    }
   }
 
   function renderRmseTiles(fits) {

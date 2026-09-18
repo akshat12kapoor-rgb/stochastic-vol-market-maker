@@ -1,7 +1,8 @@
 // Tab switching + lazy per-view init. Each view module (view_*.js) defines
-// `window.Views.<name> = { init() {...}, activate() {...} }` on `window.Views`.
+// `window.Views.<name> = { init() {...}, activate() {...} }` on `window.Views`
+// (declared in common.js, which loads before the view_*.js files -- this
+// script loads LAST, after every view has already registered itself).
 
-window.Views = window.Views || {};
 const _initialized = {};
 
 // Shared cross-view state: when the Sweep view wants to load a seed into

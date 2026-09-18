@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pathlib
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.staticfiles import StaticFiles
 
 from webapp.routers import backtest, pricer, sweep, vol_surface
@@ -27,6 +27,13 @@ app.include_router(sweep.router)
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    # Silences the browser's automatic favicon request (was a harmless but
+    # noisy 404 against the StaticFiles mount below).
+    return Response(status_code=204)
 
 
 # Serves index.html at "/" and everything else in webapp/static/ (app.js,
