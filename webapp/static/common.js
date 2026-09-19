@@ -58,6 +58,11 @@ function el(tag, attrs, children) {
   const e = document.createElement(tag);
   if (attrs) {
     Object.entries(attrs).forEach(([k, v]) => {
+      // Skip undefined-valued attrs entirely (e.g. `selected: cond ? "selected" : undefined`)
+      // -- setAttribute(k, undefined) would stringify to "undefined" and still mark a boolean
+      // attribute like `selected` as present, which broke default-option selection (the last
+      // <option> in a <select> always "wins" once more than one carries `selected`).
+      if (v === undefined) return;
       if (k === "class") e.className = v;
       else if (k === "html") e.innerHTML = v;
       else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v);
