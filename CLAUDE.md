@@ -33,7 +33,10 @@ python -m pricing.vol_surface        # (import only; see pricing/vol_surface.py 
 python -m vol_models.comparison      # BS vs Heston vs SABR vol-surface fit comparison -> data/vol_model_comparison.png
 python -m backtest.comparison        # single-path BS-quoting vs Heston-quoting backtest -> data/backtest_pnl_comparison.png
 python -m notebooks.sweep_analysis   # 40-seed sweep + regime case studies -> data/sweep_*.png, notebooks/FINAL_REPORT.md
-uvicorn webapp.main:app --reload --port 8000   # web UI -> http://localhost:8000/
+uvicorn webapp.main:app --reload --port 8001   # web UI -> http://localhost:8001/
+# port 8000 conflicts with a Docker container on this machine (also uvicorn,
+# also returns {"detail":"Not Found"} for "/") -- browsers prefer its IPv6
+# listener over this app's IPv4-only one, so "/" 404s if you use 8000.
 ```
 
 ## Key facts worth knowing before changing anything
